@@ -1,0 +1,967 @@
+---
+title: "Phylogenetic imputation"
+author: "Mathew Rees"
+date: "`r Sys.Date()`"
+output: 
+  html_notebook:
+    number_sections: true
+    code_folding: "hide"
+    df_print: "paged"
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+# Premisce
+
+In this Notebook I want to explore methods of phylogenetic imputation, that is, using phylogenetic information to impute missing values in any given dataset, be these continuous (including count) or discrete.
+
+It is important to understand that most methods implicitly rely on the assumption that the phylogeny will help predict the traits better. Either because closely related species tend to share more similar trait values than distantly related species, or because we assume that traits are constrained by evolution according to a certain model (like Brownian Motion). This is of course not always true. Thus is it also important to test for phylogenetic signal in any given trait (more on this later). If traits do not show any phylogenetic signal, then trying to impute them using the phylogeny becomes uninformative and can potentially reduce the precision of the imputed values.
+
+One personal observation is that phylogenetic signal will increase with the size of the dataset. That is, if you are trying to predict traits for a list of 100 species, you might find that using a phylogeny with only 100 tips will perform poorly relative to a phylogeny of 1,000 tips.
+
+It is also possible to incorporate a correlation structure linked to other traits that might be helpful in imputing the missing values, just like you would do if you used a linear model, or imputation by PCA or even Multiple Imputation by Chained Equations (MICE).
+
+Finally, it will be important to have a measure of validation of the imputed values. A cross validation or monte carlo procedure can be used for this (see Molina-Venegas, 2023).
+
+# Measuring phylogenetic signal
+
+Load the libraries
+
+```{r, warning=F, error=F, message=F}
+library(phytools)
+library(phangorn)
+library(Rphylopars)
+library(tidyverse)
+library(ape)
+library(geiger)
+library(missForest)
+library(funspace)
+library(readxl)
+library(car)
+library(picante)
+library(Hmisc)
+library(broom)
+library(PerformanceAnalytics)
+library(ade4)
+```
+
+
+Ok, let's get started with some simple examples.
+
+Lets assume that our dataset consists of continuous and discrete data.
+Here we can start by using the dataset from [Sandra diaz et al., 2022](https://www.nature.com/articles/s41597-022-01774-9) which is an enhanced dataset containing the 6 major traits of the global spectrum of plant form and function (Diaz et al. 2016) plus some other information for about 46,000 species.
+
+
+```{r, error=FALSE, warning=FALSE}
+data <- read_xlsx("../Functional traits/Diaz et al. 2022. Enhanced Trait database/Try2023123184331480_Dataset/Dataset/Species_mean_traits.xlsx", sheet = 1, col_names = T) %>% 
+  dplyr::rename(Species = `Species name standardized against TPL`, 
+                LDMC = `LDMC (g/g)`, 
+                LA=`Leaf area (mm2)`, 
+                Nmass=`Nmass (mg/g)`, 
+                LMA = `LMA (g/m2)`, 
+                Height = `Plant height (m)`,
+                Seedmass = `Diaspore mass (mg)`,
+                SSD = `SSD combined (mg/mm3)`)
+
+data$Species <- gsub(" ", "_", data$Species)
+
+data <- strings2factors(data)
+
+str(data)
+```
+
+We can start by filtering this datset to select only the species which have all observations of traits and are subgeneric level observations.
+
+```{r}
+filtered_data <- data %>% filter(`Number of traits with values` > 5 & `Taxonomic level` != "genus")
+
+dim(filtered_data)
+```
+
+Ok so that's 2214 species left. 
+
+Check if there are any NAs
+
+```{r}
+cat(sum(is.na(filtered_data)) / (nrow(filtered_data)*ncol(filtered_data)) * 100, "%")
+```
+So still about 15% missing data, that is from the column LDMC.
+
+Check the distribution of each variable.
+
+```{r, warning=FALSE, error=FALSE}
+filtered_data %>% dplyr::select(LDMC, LA, Nmass, LMA, SSD, Height, Seedmass) %>% 
+  gather %>% 
+  ggplot(aes(value, fill=key)) + geom_density() + facet_wrap(facets = ~key, scales = "free")
+```
+
+Now log them all and check they are more or less normally distributed.
+
+```{r}
+
+new <- filtered_data %>% column_to_rownames("Species") %>% 
+  dplyr::select(LDMC, LA, Nmass, LMA, SSD, Height, Seedmass) %>% log() 
+
+new %>%  
+  gather %>% 
+  ggplot(aes(value, fill=key)) + geom_density() + facet_wrap(facets = ~key, scales = "free")
+
+# Check for normality
+apply(new, 2, shapiro.test) %>% do.call(rbind, .)
+```
+
+Ok so it's not perfect but it is much better.
+
+Let's see what the correlations between traits are.
+
+```{r, warning=FALSE, error=FALSE}
+
+new %>% 
+  as.matrix() %>% 
+  Hmisc::rcorr() %>% 
+  broom::tidy()
+
+new %>% 
+  chart.Correlation()
+```
+
+So there is some good correlation between log(SSD) and log(LDMC) and between log(SSD) and log(Height).
+log(Height) and log(Seedmass) aren' too bad either.
+
+Ok now we need a phylogeny for these. Fortunately for us, the package funspace includes a phylogeny for these species [Carmona et al. 2021](https://www.nature.com/articles/s41586-021-03871-y).
+
+```{r}
+phy <- funspace::phylo
+```
+
+## Brownian motion
+
+Most tests for phylogenetic signal rely on Brownian Motion (BM), which is equivalent to a random walk through time with a known variance `sigma^2`. This means that as time increases, the variance also increases between two given tips.
+
+Two widely used metrics for measuring phylogenetic signal under BM are Pagel's $\lambda$ and Bloomberg's `K` (see Pagel 1999 and Bloomberg 2003). These are usually defined between [0,1] such as 0 is complete randomness and 1 perfectly matches BM. $\lambda$ can effectively be higher than 1 but is generally no well defined over that limit. `K` can be higher than 1, effectively meaning there is stronger signal than you would expect under BM.
+
+For binary categorical traits, the only method I am confident in using is the phylo.d method by Fritz and Purvis (2010), implemented in `caper`. Another method is the $\delta$ statistic by Borges et al. 2019 (implemented here https://github.com/mrborges23/delta_statistic/tree/master).
+
+Let's see if any of our traits can be measured with these two metrics.
+
+As a reminder, I am using log transformed variables for modelling. This is easier to fit under Brownian models of evolution and so is more appropriate to test for phylogenetic signal under these models.
+
+First, let's match our phylogeny and trait data. Because the dataset is quite large, let's subsample 500 species and run our analyses on this. We can expand the dataset to see how the tests perform on a larger dataset.
+
+Quick fix in the tree tip labels
+
+```{r}
+phy$tip.label[4884] <- "Cercocarpus_montanus_var._glaber"
+```
+
+
+```{r, comment=F, message=F, warning=F, results='hide', echo=F}
+set.seed(123)
+
+# picante
+phylo_traits <- match.phylo.data(phy = phy, data = new[sample(nrow(new), 500, replace = F),])
+```
+
+Ok now we can compute `K` and $\lambda$ for each trait. Some models work best when the trees are completely resolved (ie. no polytomies). Thus we will make sure our tree fits this assumption. If necessary we can transform the tree with polytomies into dichotomies with zero branch lengths using the hand `multi2di` function.
+
+```{r}
+is.binary(phylo_traits$phy)
+phylo_traits$phy <- multi2di(phylo_traits$phy)
+```
+Great, now let's calculate `K` and $\lambda$ for Leaf Mass per Area.
+
+## LMA
+
+```{r}
+
+LMA <- phylo_traits$data$LMA %>% setNames(rownames(phylo_traits$data))
+
+(K.LMA<-phylosig(tree = phylo_traits$phy, x = LMA, method = "K", test = T, nsim=500) )
+plot.phylosig(K.LMA)
+
+# This takes a very long time to compute for larger datasets but the geiger function `fitcontinuous` with model = lambda, provides the same result
+(lambda.LMA<-phylosig(tree = phylo_traits$phy, x = LMA, method = "lambda", test = T) )
+```
+
+Ok, we can see that there is a very low value of K, and that this value is significantly different from random. 
+
+But we can also see that there is a much higher value for $\lambda$.
+
+How can this be? Both are supposed to quantify phylogenetic signal. They do in fact look at different aspects of phylogenetic signal. K is a ratio of within to between clade variance, whilst lambda is a transformation of the diagonal element of the pVCV matrix.
+
+The p-values here compare the results to a null expectation of randomness, but there is not automated way of comparing this to a null expectation of Brownian motion. We have to do this manually.
+
+```{r}
+#p.93 of the book Phylogenetic Comparative Methods in R (Revell & Harmon, 2022)
+#simulate 1000 datasets
+nullX <- fastBM(phylo_traits$phy, nsim = 1000)
+## for each, carry out a test of phylogenetic signal
+## amd accumulate these into a vector using apply
+nullK <- apply(nullX,2,phylosig, tree=phylo_traits$phy)
+#calcultae p.values
+Pvals_LMA <- mean(nullK<=K.LMA$K)
+Pvals_LMA
+```
+
+Check this out visually
+
+```{r}
+hist(c(nullK, K.LMA$K), breaks=100, col="lightgray", border="black", main="", xlab="K", las=1, cex.axis=0.7, cex.lab=0.9, ylim=c(0,2000), xlim=c(0,4))
+arrows(x0=K.LMA$K, y0=par()$usr[4], y1=0, length=0.12, col=make.transparent("blue", 0.5), lwd=2)
+text(K.LMA$K, 0.96*par()$usr[4], paste("observed value of K (P=  ", round(Pvals_LMA, 4), ")", sep = ""), pos=4, cex=0.8)
+```
+We can see that the distribution of K under Brownian motion is very widespread! But our value of K is indeed lower than expected under Brownian motion.
+
+What about the value of lambda? Can we reject a null of lambda = 1?
+
+We can use a likelihood ratio test for this one.
+
+```{r}
+(LR_LMA <- -2*(lambda.LMA$lik(1) - lambda.LMA$logL) )
+```
+
+Now compute the p-value (assuming chi-square distribution under the null hypothesis of lambda = 1)
+
+```{r}
+Pval_lambda_LMA <- pchisq(LR_LMA, df=1, lower.tail = F )
+Pval_lambda_LMA
+```
+
+So we can reject the null that $\lambda$ = 1.
+
+This means that both `K` and $\lambda$ are telling us there is more phylogenetic signal than random, but less than expected under Brownian motion. So perhaps overdispersed ?
+
+We can also compare these results to other models of evolution, like Early-Burst (EB) or Ornstein-Uhlenbeck (OU) models.
+
+```{r}
+(BM.LMA <- fitContinuous(phylo_traits$phy, LMA, model = "BM") )
+
+(EB.LMA <- fitContinuous(phylo_traits$phy, LMA, model = "EB") )
+
+(OU.LMA <- fitContinuous(phylo_traits$phy, LMA, model = "OU") )
+
+(Lambda.LMA <- fitContinuous(phylo_traits$phy, LMA, model = "lambda") )
+```
+
+It seems like the `a` parameter for the EB model is close to 0, which is effectively equivalent to a BM.
+
+If we check the output for the lambda model, this is the same as using the `phylosig` function from phytools but does it much quicker and with a few more bits of information.
+
+
+```{r}
+#However if the OU model seems to be at bounds with the `alpha` parameter, then we can increase this and see how the model performs.
+
+#(OU.LMA <- fitContinuous(phylo_traits$phy, LMA, model = "OU", bounds = list(alpha=c(0,50))) )
+```
+
+It's also good to see how these compare to random noise model. `white` is a white-noise (non-phylogenetic) model, which assumes data come from a single normal distribution with no covariance structure among species. The variance parameter sigsq takes the same bounds defined under the BM model.
+
+
+```{r}
+null.LMA <- fitContinuous(phy = phylo_traits$phy, dat = LMA, model = "white")
+```
+
+
+Now we can compare how well each model performs using AIC
+
+```{r}
+(aics_models <- setNames(c(AIC(BM.LMA), AIC(EB.LMA), AIC(OU.LMA), AIC(null.LMA)), c("BM", "EB", "OU", "NULL")) )
+```
+
+Seems like the OU model has the lowest AIC. We can also check the weights.
+
+```{r}
+aic.w(aics_models)
+```
+
+What about comparing OU to Lambda model ?
+
+```{r}
+aic.w(setNames(c(AIC(OU.LMA), AIC(Lambda.LMA)), c("OU", "Lambda")) )
+```
+
+So in this case the lambda transformation fits the data better.
+
+We can check this out visually and apply the lambda and OU transformations.
+
+```{r}
+#normal tree
+contMap(tree = phylo_traits$phy, x = LMA, ftype = "off", type = "fan", lwd=2)
+
+#lambda transformation
+#contMap(tree = lambdaTree(phylo_traits$phy,lambda = Lambda.LMA$opt$lambda), x = LMA, fsize = 0.7, ftype = "off", type = "fan", lwd=2)
+# or use this
+contMap(tree = rescale(phylo_traits$phy, model = "lambda", lambda = Lambda.LMA$opt$lambda), x = LMA, ftype = "off", type = "fan", lwd=2)
+
+#OU transformation
+contMap(tree = rescale(phylo_traits$phy, model = "OU", alpha=OU.LMA$opt$alpha), x = LMA, ftype = "off", type = "fan", lwd=2)
+```
+
+The OU model seems quite strange. It looks like most branches have been shortened so much they are almost like a star phylogeny.
+
+We can do this for all the traits one by one and see how much phylogenetic signal they have.
+
+
+```{r}
+SSD <- phylo_traits$data$SSD %>% setNames(rownames(phylo_traits$data))
+Height <- phylo_traits$data$Height %>% setNames(rownames(phylo_traits$data))
+LA <- phylo_traits$data$LA%>% setNames(rownames(phylo_traits$data))
+LDMC <- phylo_traits$data$LDMC %>% setNames(rownames(phylo_traits$data)) # has some NA values
+Nmass <- phylo_traits$data$Nmass %>% setNames(rownames(phylo_traits$data))
+Seedmass <- phylo_traits$data$Seedmass %>% setNames(rownames(phylo_traits$data))
+```
+
+Now fit the models
+
+## SSD
+
+```{r}
+(K.SSD<-phylosig(tree = phylo_traits$phy, x = SSD, method = "K", test = T, nsim=500) )
+plot.phylosig(K.SSD)
+
+(Lambda.SSD <- fitContinuous(phylo_traits$phy, SSD, model = "lambda") )
+
+(BM.SSD <- fitContinuous(phylo_traits$phy, SSD, model = "BM") )
+
+(EB.SSD <- fitContinuous(phylo_traits$phy, SSD, model = "EB") )
+
+(OU.SSD <- fitContinuous(phylo_traits$phy, SSD, model = "OU") )
+
+(null.SSD <- fitContinuous(phylo_traits$phy, SSD, model = "white"))
+```
+
+Here $\lambda$ is 0.96, so pretty strong
+
+Check which fits best and the AIC weights
+
+```{r}
+(aics_models <- setNames(c(AIC(BM.SSD), AIC(EB.SSD), AIC(OU.SSD), AIC(null.SSD)), c("BM", "EB", "OU", "NULL")) )
+
+aic.w(aics_models)
+```
+
+Again, OU seems to do best.
+
+## Nmass
+
+```{r}
+(K.Nmass<-phylosig(tree = phylo_traits$phy, x = Nmass, method = "K", test = T, nsim=500) )
+plot.phylosig(K.Nmass)
+
+(Lambda.Nmass <- fitContinuous(phylo_traits$phy, Nmass, model = "lambda") )
+
+(BM.Nmass <- fitContinuous(phylo_traits$phy, Nmass, model = "BM") )
+
+(EB.Nmass <- fitContinuous(phylo_traits$phy, Nmass, model = "EB") )
+
+(OU.Nmass <- fitContinuous(phylo_traits$phy, Nmass, model = "OU") )
+
+(null.Nmass <- fitContinuous(phylo_traits$phy, Nmass, model = "white"))
+```
+
+Here K seems to be non-significant. Lambda is moderate to high.
+
+Check AIC weights
+
+```{r}
+(aics_models <- setNames(c(AIC(BM.Nmass), AIC(EB.Nmass), AIC(OU.Nmass), AIC(null.Nmass)), c("BM", "EB", "OU", "NULL")) )
+
+aic.w(aics_models)
+```
+
+This time a null model of white noise (grand mean) is best. 
+
+## Height
+
+```{r}
+(K.Height<-phylosig(tree = phylo_traits$phy, x = Height, method = "K", test = T, nsim=500) )
+plot.phylosig(K.Height)
+
+(Lambda.Height <- fitContinuous(phylo_traits$phy, Height, model = "lambda") )
+
+(BM.Height <- fitContinuous(phylo_traits$phy, Height, model = "BM") )
+
+(EB.Height <- fitContinuous(phylo_traits$phy, Height, model = "EB") )
+
+(OU.Height <- fitContinuous(phylo_traits$phy, Height, model = "OU") )
+
+(null.Height <- fitContinuous(phylo_traits$phy, Height, model = "white"))
+```
+
+Lambda is pretty much equal to 1
+
+Check AIC weights
+
+```{r}
+(aics_models <- setNames(c(AIC(BM.Height), AIC(EB.Height), AIC(OU.Height), AIC(null.Height)), c("BM", "EB", "OU", "NULL")) )
+
+aic.w(aics_models)
+```
+OU model fits data best
+
+## LA
+
+```{r}
+(K.LA<-phylosig(tree = phylo_traits$phy, x = LA, method = "K", test = T, nsim=500) )
+plot.phylosig(K.LA)
+
+(Lambda.LA <- fitContinuous(phylo_traits$phy, LA, model = "lambda") )
+
+(BM.LA <- fitContinuous(phylo_traits$phy, LA, model = "BM") )
+
+(EB.LA <- fitContinuous(phylo_traits$phy, LA, model = "EB") )
+
+(OU.LA <- fitContinuous(phylo_traits$phy, LA, model = "OU") )
+
+(null.LA <- fitContinuous(phylo_traits$phy, LA, model = "white"))
+```
+
+
+Check AIC weights
+
+```{r}
+(aics_models <- setNames(c(AIC(BM.LA), AIC(EB.LA), AIC(OU.LA), AIC(null.LA)), c("BM", "EB", "OU", "NULL")) )
+
+aic.w(aics_models)
+```
+
+Again, OU
+
+## LDMC
+
+```{r}
+(K.LDMC<-phylosig(tree = phylo_traits$phy, x = LDMC[!is.na(LDMC)], method = "K", test = T, nsim=500) )
+plot.phylosig(K.LDMC)
+
+(Lambda.LDMC <- fitContinuous(phylo_traits$phy, LDMC[!is.na(LDMC)], model = "lambda") )
+
+(BM.LDMC <- fitContinuous(phylo_traits$phy, LDMC[!is.na(LDMC)], model = "BM") )
+
+(EB.LDMC <- fitContinuous(phylo_traits$phy, LDMC[!is.na(LDMC)], model = "EB") )
+
+(OU.LDMC <- fitContinuous(phylo_traits$phy, LDMC[!is.na(LDMC)], model = "OU") )
+
+(null.LDMC <- fitContinuous(phylo_traits$phy, LDMC[!is.na(LDMC)], model = "white"))
+```
+
+Moderate signal
+
+Check AIC weights
+
+```{r}
+(aics_models <- setNames(c(AIC(BM.Height), AIC(EB.Height), AIC(OU.Height), AIC(null.Height)), c("BM", "EB", "OU", "NULL")) )
+
+aic.w(aics_models)
+```
+Again, OU
+
+
+
+So overall , the Ornstein-Uhlenbeck model seems to be the best model for most of our data, except Nmass which varies along a grand mean (white-noise).
+
+# Categorical traits
+
+Check the categorical trait `Growth Form`
+
+We will use the $\delta$ statistic for this.
+
+```{r}
+source("https://raw.githubusercontent.com/mrborges23/delta_statistic/master/code.R")
+
+trait <- filtered_data %>% dplyr::select(Species, `Growth Form`) %>% column_to_rownames("Species") %>% .[rownames(phylo_traits$data),]
+
+# This takes a very long time, go for lunch or something ...
+#deltaA <- delta(trait,phylo_traits$phy,0.1,0.0589,10000,10,100)
+```
+
+And check the p-value by using randomization.
+
+This can take a while again ...
+
+```{r}
+# random_delta <- rep(NA,100)
+# for (i in 1:100){
+#   rtrait <- sample(trait)
+#   random_delta[i] <- delta(rtrait,phylo_traits$phy,0.1,0.0589,10000,10,100)
+# }
+# p_value <- sum(random_delta>deltaA)/length(random_delta)
+# boxplot(random_delta)
+# abline(h=deltaA,col="red")
+```
+
+For binary data you can uncomment the code bellow
+
+```{r}
+# caper is a bit fussy about the format of the data
+# we need to provide a tree with no node names
+# caper.tree <- phylo_traits$phy
+# caper.tree$node.label <- NULL
+# 
+# comp.data <- comparative.data(caper.tree, yourdataframe_with_column_of_interest , Species)
+# 
+# comp.data
+# 
+# D <- phylo.d(comp.data, binvar = Growth)
+```
+
+
+--------------------------------------------------------------------------------
+
+# Chosing imputation method
+
+So now that we have an idea of the strength of the phylogenetic signal, it's time to decide on a method of imputation.
+
+Currently there are 3 main flavours of phylogenetic imputation [see review in Molna-Venegas et al. 2018](https://www.cica.es/wp-content/uploads/2018/03/Molina-Venegas_2018_Imputation.pdf):
+
+  - phylogenetic generalized linear models (pGLM; Swenson 2014, Goolsby et al. 2016a)
+  - phylogenetic eigenvector regression models (PVR; DinizFilho et al. 1998) 
+  - phylogenetic eigenvector maps (PEM; Guénard et al. 2013)
+  
+pGLM can easily be implemented by fitting a pVCV matrix as the correlation structure in a gls model (package `nlme`). This assumes a Brownian model of evolution. More sophisticated ways of implementing a pGLM can be done with the package `rPhylopars` and several evolutionary models can be fitted. See tutorial [here](https://besjournals.onlinelibrary.wiley.com/action/downloadSupplement?doi=10.1111%2F2041-210X.12612&file=mee312612-sup-0003-AppendixS3.pdf)
+
+PVR can be fit using a randomForest approach in the package `missForest`. One simply needs to transform the phylogeny into a phylogenetic distance matrix and use this in a PCoA. Then the PCoA axes are added as extra variables to the trait matrix as predictors.
+
+PEM can be fit using the R package `MPSEM`. This expands on the PVR method by adding an evolutionary model and is thus considered more appropriate for evo-eco modelling. The tree is transformed prior to transforming into distance matrix and PCoA.
+
+A fourth option would be to use Bayesian Hierarchical Matrix Factorization (BHPMF), which has been used by many publications for trait imputation. This method however doesn't really use the phylogeny or quantify phylogenetic signal. It uses a taxonomic hierarchy and assumes that all ranks are equal and contain information. In reality, all taxonomic ranks are not equal, as some genera can be older than certain families for example. As with all Bayesian models, it will usually be much slower but will provide uncertainty of the prediction.
+
+## pGLM
+
+Let's see a simple example with pGLM
+
+First, let's randomly remove 10% of all values in the data frame. The `missForest` package can make this easy for us using the `prodNA` function.
+
+```{r}
+set.seed(4312)
+missing <- phylo_traits$data[,-1] %>% prodNA(0.1)
+
+head(missing)
+```
+
+
+`RPhylopars` is a bit fussy and requires a `species` column (all lower case) that is the very first column in the trait matrix.
+
+```{r}
+missing <- missing %>% 
+  mutate(species = rownames(.)) %>% 
+  dplyr::select(species, everything())
+
+model.BM <- phylopars(tree = phylo_traits$phy, trait_data = missing, model = "BM")
+model.BM
+summary(model.BM)
+```
+
+We can compare with other models. EB, OU, lambda and two variants of multivariate-OU (with full alpha or fixed alpha which corresponds to the adaptation rate parameter)
+
+```{r}
+model.OU <- phylopars(trait_data = missing, tree = phylo_traits$phy, model = "OU")
+
+model.mvOU <- phylopars(trait_data = missing, tree = phylo_traits$phy, model = "mvOU", full_alpha = TRUE, usezscores = FALSE) # the usezscores = F is a short term solution to a version issues on CRAN, see here https://github.com/ericgoolsby/Rphylopars/issues/54
+
+model.mvOU_diag <- phylopars(trait_data = missing, tree = phylo_traits$phy, model = "mvOU", full_alpha = FALSE, usezscores = FALSE)
+
+model.EB <- phylopars(trait_data = missing, tree = phylo_traits$phy, model = "EB")
+
+model.lambda <- phylopars(trait_data = missing, tree = phylo_traits$phy, model = "lambda")
+```
+
+This can take quite a while to run.
+
+We can compare the AICs of each model.
+
+```{r}
+aics_models2 <- setNames(c(AIC(model.BM), AIC(model.OU), AIC(model.mvOU), AIC(model.mvOU_diag), AIC(model.EB), AIC(model.lambda)), c("BM", "OU", "mvOU", "mvOU_diag", "EB", "lambda"))
+
+aics_models2
+
+aicw(aics_models2)
+
+```
+
+Here a lambda transformation applied to the tree seems to fit the data best.
+
+We can now get the imputed values from the model and use the variance to figure out their lower and upper 95% conf interval.
+
+```{r}
+model.lambda$anc_recon[1:5,] %>% as_tibble() # means
+model.lambda$anc_var[1:5,] %>% as_tibble() # variances
+model.lambda$anc_recon[1:5,]- sqrt(model.lambda$anc_var[1:5,])*1.96 # Lower 95% CI
+model.lambda$anc_recon[1:5,]+ sqrt(model.lambda$anc_var[1:5,])*1.96 #Upper 95% CI
+```
+
+You can see that the variance for Seedmass is quite high. For Solidago_rigida, the trait values go from -2.57 to 3.27.
+
+```{r}
+# variance in Seedmass missing values imputed by Rphylopars
+model.lambda$anc_var[which(is.na(missing$Seedmass)),"Seedmass"] %>% summary()
+```
+We could use this to filter out imputed values that have too high a variance.
+
+
+## PVR
+
+Now we will use the Phylogenetic Eigenvector Regression technique (PVR).
+
+```{r}
+phylo.cor <- cophenetic.phylo(phylo_traits$phy)
+
+# Check if the distance matrix is euclidean, if not, can square root the phylogeny
+is.euclid(as.dist(phylo.cor))
+
+phylo.pcoa <- dudi.pco(d = as.dist(phylo.cor), scannf = F, full = T)
+# from ape, calculates broken stick automatically
+phylo.pcoa2 <- pcoa(D = as.dist(phylo.cor))
+```
+
+Ok now we have our phylogenetic eigenevectors, the question is how many do we select to include into our regression?
+
+Some people say all, some people say use a broken stick model, some people say use those that explain at least 50% of variance. See discussion by Rolhf , 2001 and Martins et al. 2002.
+
+For now I will use the broken stick model. Some have suggested `fa.parallel` from package `psych` but I have had many issues with this.
+We can check this out visually and extract these from the object
+
+```{r}
+ggplot() + geom_point(data=phylo.pcoa2$values, aes(x=1:nrow(phylo.pcoa2$values), y=Relative_eig), col="blue") + geom_point(data=phylo.pcoa2$values, aes(x=1:nrow(phylo.pcoa2$values), y=Broken_stick), col="red")
+
+(sig.EV <-phylo.pcoa2$values[which(phylo.pcoa2$values$Relative_eig > phylo.pcoa2$values$Broken_stick),])
+```
+
+
+
+```{r}
+# Take the eigenvectors and add them to the traits matrix
+
+missing_phylo <- cbind(missing, phylo.pcoa$li[,1:nrow(sig.EV)]) %>% dplyr::select(-species)
+
+pvr <- missForest(xmis = missing_phylo, ntree = 1000, maxiter = 100, variablewise = T)
+```
+
+Check the output
+
+```{r}
+head(pvr)
+```
+
+We can see that the Out Of Bag Error (OOB) is much higher for trait 6 (ie. Seed Mass) with an OOB of 3.03 compared to others.
+
+Compare the results of the true matrix, the rPhylopars approach and the missForest approach
+
+```{r}
+phylo_traits$data[,-1]
+pvr$ximp
+data.frame(model.lambda$anc_recon[1:200,])
+```
+
+We can check how well this has done for each variable
+
+```{r}
+# LMA
+missing.LMA <- which(is.na(missing$LMA))
+
+cor(phylo_traits$data[missing.LMA,"LMA"], pvr$ximp[missing.LMA,"LMA"]) %>% round(2) %>% paste("cor",.,"PVR")
+
+cor(phylo_traits$data[missing.LMA,"LMA"], model.lambda$anc_recon[missing.LMA,"LMA"]) %>% round(2) %>% paste("cor",.,"pGLM")
+```
+
+```{r}
+#LA
+missing.LA <- which(is.na(missing$LA))
+
+cor(phylo_traits$data[missing.LA,"LA"], pvr$ximp[missing.LA,"LA"]) %>% round(2) %>% paste("cor",.,"PVR")
+
+cor(phylo_traits$data[missing.LA,"LA"], model.lambda$anc_recon[missing.LA,"LA"]) %>% round(2) %>% paste("cor",.,"pGLM")
+```
+Not great here for both of them. pGLM is much better though.
+
+```{r}
+#Nmass
+missing.Nmass <- which(is.na(missing$Nmass))
+
+cor(phylo_traits$data[missing.Nmass,"Nmass"], pvr$ximp[missing.Nmass,"Nmass"]) %>% round(2) %>% paste("cor",.,"PVR")
+
+cor(phylo_traits$data[missing.Nmass,"Nmass"], model.lambda$anc_recon[missing.Nmass,"Nmass"]) %>% round(2) %>% paste("cor",.,"pGLM")
+```
+
+```{r}
+#SSD
+missing.SSD <- which(is.na(missing$SSD))
+
+cor(phylo_traits$data[missing.SSD,"SSD"], pvr$ximp[missing.SSD,"SSD"]) %>% round(2) %>% paste("cor",.,"PVR")
+
+cor(phylo_traits$data[missing.SSD,"SSD"], model.lambda$anc_recon[missing.SSD,"SSD"]) %>% round(2) %>% paste("cor",.,"pGLM")
+```
+
+```{r}
+#Seedmass
+missing.Seedmass <- which(is.na(missing$Seedmass))
+
+cor(phylo_traits$data[missing.Seedmass,"Seedmass"], pvr$ximp[missing.Seedmass,"Seedmass"]) %>% round(2) %>% paste("cor",.,"PVR")
+
+cor(phylo_traits$data[missing.Seedmass,"Seedmass"], model.lambda$anc_recon[missing.Seedmass,"Seedmass"]) %>% round(2) %>% paste("cor",.,"pGLM")
+```
+
+And height
+
+```{r}
+#Height
+missing.Height <- which(is.na(missing$Height))
+
+cor(phylo_traits$data[missing.Height,"Height"], pvr$ximp[missing.Height,"Height"]) %>% round(2) %>% paste("cor",.,"PVR")
+
+cor(phylo_traits$data[missing.Height,"Height"], model.lambda$anc_recon[missing.Height,"Height"]) %>% round(2) %>% paste("cor",.,"pGLM")
+```
+
+Ok so overall it's not too bad! Both methods are very comparable and only Leaf Area and Nitrogen Mass are poorly reconstructed. 
+
+What happens if we try and impute these without phylogenetic information?
+
+```{r}
+impute.nophylo <- missForest(xmis = missing[,-1], ntree = 1000, maxiter = 100, variablewise = T)
+cor(phylo_traits$data[missing.LA,"LA"], impute.nophylo$ximp[missing.LA,"LA"])
+cor(phylo_traits$data[missing.Nmass,"Nmass"], impute.nophylo$ximp[missing.Nmass,"Nmass"])
+
+```
+
+
+Ok so for `Leaf Area`, it's a tad worse than when using phylogeny, for `Nmass` it's the same. This is because `Leaf Area` doesn't have super strong phylogenetic signal and `Nmass` has no phylogenetic signal at all and is best fitted by a white-noise model.
+
+It is also possible that the first phylogenetic eigenvectors that we selected aren't the ones that best suit `Leaf Area`, so the PVR method does poorly.
+
+
+We can check the out of bag error
+
+```{r}
+rbind(pvr$OOBerror[1:6], impute.nophylo$OOBerror) %>% `colnames<-`(names(impute.nophylo$ximp)) %>% `rownames<-`(c("RF_PVR", "RF_no_phylo"))
+```
+
+Interesting, the OOB error for NMass is quite low compared to others, but the correlation of the imputed values is bad.
+
+Let's quickly check the correlation between traits
+
+```{r}
+cor(phylo_traits$data[,-1])
+```
+
+
+## PEM
+
+This part is very much experimental, and I don't quite have a strong grip on it yet.
+
+```{r}
+library(MPSEM)
+tree.pgraph <- Phylo2DirectedGraph(phylo_traits$phy)
+```
+
+```{r}
+tree.PEM <-PEM.build(tree.pgraph, d="distance",sp="species") # here I'm not adding any a or psi parameters
+as.data.frame(tree.PEM)
+```
+
+This next solution requires complete trait values, no NAs.
+
+```{r}
+# here we can let the data speak for itself
+# use RMLE to estimate a 
+tree.PEM_opt2 <- PEM.fitSimple(
+y = as.matrix(phylo_traits$data[,-1]),
+x=NULL,
+w = tree.pgraph,
+d = "distance", sp="species",
+lower = 0, upper = 1)
+
+```
+
+The package uses a linear model via stepwise selection based on AIC criterion. It can only do it for one trait at a time and can accept a certain amount of NA values.
+
+```{r}
+# Is very slow for large datasets
+##lm2 <- lmforwardsequentialAICc(y = missing[,2], object = tree.PEM_opt2)
+#summary(lm2)
+```
+
+```{r}
+## Estimating ancestral trait values:
+ANCloc <- getAncGraphLocations(tree.pgraph)
+PEMfsAnc <- PEM.fitSimple(y=as.matrix(phylo_traits$data[,-1]),
+                          x=NULL,
+                          w=ANCloc$x,
+                          d="distance",sp="species",
+                          lower=0,upper=1)
+```
+
+```{r}
+PEManc1 <- Locations2PEMscores(PEMfsAnc, ANCloc)
+# there is another step to this section that's i can't figure how to work out yet
+```
+
+
+Now use these in the imputation method with RF.
+
+```{r}
+missing_phylo <- cbind(missing, as.data.frame(tree.PEM_opt2)[,1:ncol(sig.EV)]) %>% dplyr::select(-species)
+
+pem <- missForest(xmis = missing_phylo, ntree = 1000, maxiter = 100, variablewise = T)
+```
+
+Check
+
+```{r}
+# LMA
+missing.LMA <- which(is.na(missing$LMA))
+
+cor(phylo_traits$data[missing.LMA,"LMA"], pvr$ximp[missing.LMA,"LMA"]) %>% round(2) %>% paste("cor",.,"PVR")
+
+cor(phylo_traits$data[missing.LMA,"LMA"], model.lambda$anc_recon[missing.LMA,"LMA"]) %>% round(2) %>% paste("cor",.,"pGLM")
+
+cor(phylo_traits$data[missing.LMA,"LMA"], pem$ximp[missing.LMA,"LMA"]) %>% round(2) %>% paste("cor",.,"PEM")
+```
+
+
+```{r}
+#LA
+missing.LA <- which(is.na(missing$LA))
+
+cor(phylo_traits$data[missing.LA,"LA"], pvr$ximp[missing.LA,"LA"]) %>% round(2) %>% paste("cor",.,"PVR")
+
+cor(phylo_traits$data[missing.LA,"LA"], model.lambda$anc_recon[missing.LA,"LA"]) %>% round(2) %>% paste("cor",.,"pGLM")
+
+cor(phylo_traits$data[missing.LA,"LA"], pem$ximp[missing.LA,"LA"]) %>% round(2) %>% paste("cor",.,"PEM")
+```
+
+
+```{r}
+#Nmass
+missing.Nmass <- which(is.na(missing$Nmass))
+
+cor(phylo_traits$data[missing.Nmass,"Nmass"], pvr$ximp[missing.Nmass,"Nmass"]) %>% round(2) %>% paste("cor",.,"PVR")
+
+cor(phylo_traits$data[missing.Nmass,"Nmass"], model.lambda$anc_recon[missing.Nmass,"Nmass"]) %>% round(2) %>% paste("cor",.,"pGLM")
+
+cor(phylo_traits$data[missing.Nmass,"Nmass"], pem$ximp[missing.Nmass,"Nmass"]) %>% round(2) %>% paste("cor",.,"PEM")
+```
+
+So very similar to PVR if not worse, not much of an improvement really ... Unless I'm doing this wrong?
+
+--------------------------------------------------------------------------------
+
+# Combining the best of both worlds
+
+One solution is to run several rounds of imputation.
+
+One could use Rphylopars to first impute the continuous variables that have strong phylogenetic signal and then run phylogenetic eigenvectors with RF to impute the remaining categorical traits and traits that have low phylogenetic signal.
+
+Let's re-run the lambda model but remove NMass.
+Then we will add Nmass and the phylogenetic eigenvectors.
+
+```{r}
+model.lambda$anc_recon %>% dim()
+```
+
+```{r}
+model.lambda2 <- phylopars(trait_data = missing %>% dplyr::select(-Nmass) , tree = phylo_traits$phy, model = "lambda")
+```
+
+Now add the Nmass
+
+```{r}
+comb.model <- data.frame(model.lambda2$anc_recon[1:500,], Nmass=missing$Nmass, phylo.pcoa$li[,1:nrow(sig.EV)])
+
+pvr.comb <- missForest(xmis = comb.model, ntree = 1000, maxiter = 100, variablewise = T)
+```
+
+And now extract these and compare
+
+```{r}
+# LMA
+missing.LMA <- which(is.na(missing$LMA))
+
+cor(phylo_traits$data[missing.LMA,"LMA"], pvr$ximp[missing.LMA,"LMA"]) %>% round(2) %>% paste("cor",.,"PVR")
+
+cor(phylo_traits$data[missing.LMA,"LMA"], model.lambda$anc_recon[missing.LMA,"LMA"]) %>% round(2) %>% paste("cor",.,"pGLM")
+
+cor(phylo_traits$data[missing.LMA,"LMA"], pem$ximp[missing.LMA,"LMA"]) %>% round(2) %>% paste("cor",.,"PEM")
+
+cor(phylo_traits$data[missing.LMA,"LMA"], pvr.comb$ximp[missing.LMA,"LMA"]) %>% round(2) %>% paste("cor",.,"combined")
+```
+
+
+Nmass
+
+```{r}
+#Nmass
+missing.Nmass <- which(is.na(missing$Nmass))
+
+cor(phylo_traits$data[missing.Nmass,"Nmass"], pvr$ximp[missing.Nmass,"Nmass"]) %>% round(2) %>% paste("cor",.,"PVR")
+
+cor(phylo_traits$data[missing.Nmass,"Nmass"], model.lambda$anc_recon[missing.Nmass,"Nmass"]) %>% round(2) %>% paste("cor",.,"pGLM")
+
+cor(phylo_traits$data[missing.Nmass,"Nmass"], pem$ximp[missing.Nmass,"Nmass"]) %>% round(2) %>% paste("cor",.,"PEM")
+
+cor(phylo_traits$data[missing.Nmass,"Nmass"], pvr.comb$ximp[missing.Nmass,"Nmass"]) %>% round(2) %>% paste("cor",.,"combined")
+```
+
+Interesting, it seems like the combined method is actually worse than any method!
+
+What if we include Nmass in the original imputation, but then remove those results and re-run the randomForest ?
+
+
+```{r}
+model.lambda3 <- phylopars(trait_data = missing , tree = phylo_traits$phy, model = "lambda")
+comb.model2 <- data.frame(model.lambda3$anc_recon[1:500,-2], Nmass=missing$Nmass, phylo.pcoa$li[,1:nrow(sig.EV)])
+pvr.comb2 <- missForest(xmis = comb.model2, ntree = 1000, maxiter = 100, variablewise = T)
+
+#LMA
+cor(phylo_traits$data[missing.LMA,"LMA"], pvr$ximp[missing.LMA,"LMA"]) %>% round(2) %>% paste("cor",.,"PVR")
+
+cor(phylo_traits$data[missing.LMA,"LMA"], model.lambda$anc_recon[missing.LMA,"LMA"]) %>% round(2) %>% paste("cor",.,"pGLM")
+
+cor(phylo_traits$data[missing.LMA,"LMA"], pem$ximp[missing.LMA,"LMA"]) %>% round(2) %>% paste("cor",.,"PEM")
+
+cor(phylo_traits$data[missing.LMA,"LMA"], pvr.comb2$ximp[missing.LMA,"LMA"]) %>% round(2) %>% paste("cor",.,"combined")
+```
+
+
+```{r}
+#Nmass
+
+cor(phylo_traits$data[missing.Nmass,"Nmass"], pvr$ximp[missing.Nmass,"Nmass"]) %>% round(2) %>% paste("cor",.,"PVR")
+
+cor(phylo_traits$data[missing.Nmass,"Nmass"], model.lambda$anc_recon[missing.Nmass,"Nmass"]) %>% round(2) %>% paste("cor",.,"pGLM")
+
+cor(phylo_traits$data[missing.Nmass,"Nmass"], pem$ximp[missing.Nmass,"Nmass"]) %>% round(2) %>% paste("cor",.,"PEM")
+
+cor(phylo_traits$data[missing.Nmass,"Nmass"], pvr.comb2$ximp[missing.Nmass,"Nmass"]) %>% round(2) %>% paste("cor",.,"combined")
+```
+
+Ok, so even here it's not as good. interesting.
+
+Perhaps this is best done only with remaining categorical traits.
+
+# BHPMF
+
+Final test
+
+```{r}
+library(BHPMF)
+tmp.dir <- dirname("./tmp")
+data("hierarchy.info")
+data("trait.info")
+```
+
+```{r}
+hierarchy.info <- data.frame(plant_id = 1:500, species= rownames(missing), genus = , family = , order = )
+```
+
+
+```{r}
+BHPMF.test <- GapFilling(trait.info, hierarchy.info,
+                         mean.gap.filled.output.path = paste0(tmp.dir, "/mean_gap_filled.txt"),
+                         std.gap.filled.output.path = paste0(tmp.dir, "/std_gap_filled.txt"),
+                         tmp.dir = tmp.dir)
+```
+```{r}
+##out1 <- CalculateCvRmse(trait.info, hierarchy.info)
+```
+
+
