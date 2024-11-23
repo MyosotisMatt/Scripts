@@ -1,0 +1,262 @@
+---
+title: "Sampling points in polygons and creatign climatic clusters"
+author: "Mathew Rees"
+date: "20/05/2024"
+output: 
+  html_notebook:
+    number_sections: true
+    code_folding: "hide"
+    df_print: "paged"
+    toc: true
+    toc_depth: 3
+    toc_float: true
+---
+
+# Libraries
+
+```{r}
+library(tidyverse)
+library(tidyterra)
+library(sf)
+library(sp)
+library(raster)
+library(RStoolbox)
+library(rnaturalearth)
+library(geodata)
+library(viridis)
+library(ade4)
+library(factoextra)
+library(alphahull)
+library(mclust)
+```
+
+
+# Import polygons
+
+First we want to import a shapefile containing a polygon of the region of interest (ROI).
+
+You can use this tool to define the ROI: https://www.openstreetmap.org/export#map=6/2.460/120.256
+
+
+```{r}
+Borneo_island <- ne_countries(scale="medium", returnclass = "sf") %>% 
+  filter(admin %in% c("Indonesia", "Malaysia", "Brunei"))
+
+ROI = c(xmin= 108.699, xmax = 119.355, ymin = -4.127, ymax = 7.580)
+
+```
+
+```{r}
+Borneo <- st_crop(Borneo_island, st_bbox(ROI))
+Borneo_sfc <- Borneo %>% st_as_sfc()
+plot(Borneo_sfc)
+```
+Next I want to crop out the little part of West Sulawesi.
+
+```{r}
+cropped_extent <- c(xmin= 118, xmax = 119.355 , ymin = -4.144604, ymax = -1) %>% st_bbox() %>% st_as_sfc()
+st_crs(cropped_extent) <- st_crs(Borneo_sfc)
+```
+
+```{r}
+Borneo_sf <- st_difference(Borneo_sfc, cropped_extent) %>% st_as_sf()
+ggplot() + geom_sf(data=Borneo_sf) + theme_classic()
+```
+
+Great. Now we can simply merge the outline of all three countries
+
+```{r}
+Borneo_united <- st_union(Borneo_sf)
+ggplot() + geom_sf(data=Borneo_united) + theme_classic()
+```
+
+
+# Sampling points
+
+Let's make some random sampling points that cover the island.
+
+```{r}
+p1 = st_sample(Borneo_united, 2000)
+plot(st_geometry(Borneo_united))
+plot(p1, add = TRUE, col="red")
+```
+Here are 2000 random sample points from Borneo. You can create as many or as few as you like.
+
+```{r}
+sample_pts<-as(p1, "Spatial") %>% coordinates() %>% `colnames<-`(c("longitude", "latitude")) %>% as.data.frame()
+head(sample_pts)
+```
+
+
+# Bioclim variables
+
+We can download Bioclim variables for our ROI
+
+```{r}
+bio <- worldclim_global(var = "bio", # "tmin", "tmax", "tavg", "prec", "wind", "vapr", or "bio"
+                        res = 5, # resolution: 10, 5, 2.5, or 0.5 (minutes of a degree)
+                        path = "./wc")
+```
+
+
+```{r}
+plot(bio[[1]])
+```
+
+First, let's crop our `bio` object to the ROI.
+
+```{r}
+bio_cropped <- crop(bio, Borneo_sf)
+plot(bio_cropped[[1]])
+```
+
+# RasterPCA
+
+We can use the RSToolbox to build a PCA of Climate space
+
+
+```{r}
+bio_PCA <- rasterPCA(bio_cropped, nSamples = NULL, spca = T, maskCheck = T)
+
+plot(bio_PCA$map[[1:4]])
+```
+
+See the variance explained by the PCA axes
+
+```{r}
+summary(bio_PCA$model)
+```
+So the first Axis explains 46.7%, the second 22.8%, third 13.9% and fourth 9.7%. Together they make up 93% of variance.
+
+We can try to use a very simple k-means classifier with a predefined number of categories. Let's say 9.
+
+See here : https://bleutner.github.io/RStoolbox/reference/unsuperClass.html 
+
+```{r}
+## Run classification
+set.seed(12345)
+unC <- unsuperClass(bio_PCA$map[[1:3]], nSamples = 10000, nClasses = 9, nStarts = 25)
+unC
+
+## Plots
+colors <- rainbow(9)
+plot(unC$map, col = colors, legend = FALSE, axes = T, box = FALSE)
+##legend(1,1, legend = paste0("C",1:5), fill = colors, title = "Classes", horiz = TRUE,  bty = "n")
+```
+
+
+```{r}
+## Return the distance of each pixel to each class centroid
+unC2 <- unsuperClass(bio_PCA$map, nSamples = 10000, nClasses = 9, output = "distances")
+unC2
+
+ggR(unC2$map, 1:3, geom_raster = TRUE)
+```
+
+
+# Extracting values
+
+We can combine these PCA axes to then select our points of interest and see where they fall
+
+```{r}
+stackPCA <- brick(bio_PCA$map[[1:4]])
+```
+
+and extract the point values
+
+```{r}
+test <- extract(stackPCA, sample_pts)
+test2 <- extract(bio_cropped, sample_pts)
+```
+
+```{r}
+plot(test[,1], test[,2])
+```
+
+Check these values
+
+```{r}
+sum(is.na(test2))
+```
+
+Some cells have NA values.
+let's remove these before re-running the PCA manually
+
+```{r}
+test2.na.rm <- na.omit(test2)
+```
+
+
+```{r}
+biopca2 <- dudi.pca(test2.na.rm[,-1], center = T, scale = T, scannf = F, nf = 4)
+```
+
+```{r}
+fviz_pca(biopca2)
+get_eig(biopca2)
+fviz_eig(biopca2)
+```
+
+or a densityplot with an alpha hull contour
+for this we need to remove any duplicated values in our pca
+
+```{r}
+BIO_PCs <- biopca2$li[,1:2]
+BIO_PCs_unique <- BIO_PCs[!duplicated(BIO_PCs),]
+alpha_obj <- ashape(BIO_PCs_unique, alpha=2)
+```
+
+
+```{r}
+ggplot(data=biopca2$li, aes(Axis1, Axis2)) + 
+  stat_density2d(aes(fill = after_stat(level)), geom = "polygon", colour="white", alpha =0.3) + 
+  geom_point(size=0.2,alpha=0.2) +
+  geom_segment(data=data.frame(alpha_obj$edges), aes(x = x1, y = y1, xend = x2, yend = y2), color="red") +
+  theme_classic() + 
+  scale_fill_viridis() + 
+  labs(title = "Climatic envelope of Borneo",
+              subtitle = "Red outline is alphahull and coloured shapes represent 2D density kernel") +
+  theme(legend.position = "none")
+```
+
+
+# Classification
+
+We can use the MClust package to make some density based clustering.
+
+```{r}
+library(mclust)
+
+#Here I am using the first 3 axes only, but you can change this and see how it modifies the results
+clusters <- Mclust(biopca2$li[,1:3])
+```
+
+```{r}
+summary(clusters)
+plot(clusters, "BIC")
+```
+
+Seems like 9 clusters is the best option
+
+Let's plot these back onto the map
+
+```{r}
+ggplot() +
+  geom_sf(data=Borneo_united) +
+  geom_point(data = sample_pts[rownames(test2.na.rm),], aes(x=longitude, y=latitude, col=as.factor(clusters$classification))) + 
+  theme_classic()
+```
+
+Compare with the K-means we did earlier
+
+```{r}
+plot(unC$map, col = colors, legend = FALSE, axes = T, box = FALSE)
+```
+
+Print session info
+
+```{r}
+sessionInfo()
+```
+
+
