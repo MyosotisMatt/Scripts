@@ -12,6 +12,10 @@ output:
     toc_float: true
 ---
 
+In this script, I want to quickly show how to compare climatic clusters for a given region of interest.
+
+First, let's load some libraries.
+
 # Libraries
 
 ```{r}
@@ -33,7 +37,7 @@ library(mclust)
 
 # Import polygons
 
-First we want to import a shapefile containing a polygon of the region of interest (ROI).
+We want to import a shapefile containing a polygon of the region of interest (ROI).
 
 You can use this tool to define the ROI: https://www.openstreetmap.org/export#map=6/2.460/120.256
 
@@ -51,6 +55,7 @@ Borneo <- st_crop(Borneo_island, st_bbox(ROI))
 Borneo_sfc <- Borneo %>% st_as_sfc()
 plot(Borneo_sfc)
 ```
+
 Next I want to crop out the little part of West Sulawesi.
 
 ```{r}
@@ -80,6 +85,7 @@ p1 = st_sample(Borneo_united, 2000)
 plot(st_geometry(Borneo_united))
 plot(p1, add = TRUE, col="red")
 ```
+
 Here are 2000 random sample points from Borneo. You can create as many or as few as you like.
 
 ```{r}
