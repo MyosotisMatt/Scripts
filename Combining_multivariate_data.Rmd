@@ -1,0 +1,494 @@
+---
+title: "Combining floristic, phylogenetic, functional, ecological and structural data"
+author: "Mathew REES"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    number_sections: yes
+    code_folding: hide
+    df_print: paged
+    toc: yes
+    toc_depth: 3
+    toc_float:
+      collapsed: no
+  html_document:
+    number_sections: yes
+    code_download: true
+    code_folding: hide
+    toc: yes
+    toc_depth: '3'
+    toc_float:
+      collapsed: no
+    df_print: paged
+---
+
+```{r, message=F, error=F, echo=FALSE, comment=F, results='hide'}
+library(tidyverse)
+library(ape)
+library(picante)
+library(phytools)
+library(ade4)
+library(vegan)
+library(FD)
+library(funspace)
+library(gawdis)
+library(betapart)
+library(adiv)
+library(factoextra)
+library(PerformanceAnalytics)
+library(Hmisc)
+library(broom)
+library(ggrepel)
+library(raster)
+library(sf)
+library(gdm)
+library(seosawr)
+```
+
+# Intro
+
+In this Notebook, I want to show how to combine different datasets to obtain a consensus that might be used for conservation or downstream analyses. A great example of this comes from [Cardoso et al. 2021](https://www.frontiersin.org/articles/10.3389/fevo.2021.723558/full).
+
+For any researcher in ecology or biology, we might have datasets like plot data, trait data, phylogenies, or environmental variables. All these represent multivariate datasets, thus the techniques I will use are taken from the multivariate analyses literature with a focus on dissimilarity.
+
+Spoiler alert, the final combination of these datasets is pretty straightforward and relies on the Gower distance matrix, which is simply an average of multiple distance matrices. So the real interest here is about how to calculate our distance matrices.
+
+The difference between two communities is often referred to as Beta diversity, but there are many ways to measure this. Do we take into account the abundance of species, or are they all weighted equally (for example in presence absence datasets). We could even weigh species not by their abundance but by their unique contribution to the system (how different they are to other species, like keystone species). 
+
+# Data
+
+We can generate some random data to explore these facets.
+
+First, we need a site x species matrix.
+
+```{r}
+#community matrix with 20 species in columns and 20 sites as rows
+m <- matrix(0,nrow=20,ncol=20) %>% `colnames<-`(paste("Sp", 1:20, sep="_"))
+
+#fill in the matrix with lognornal ditribution of species and individuals
+set.seed(12345)
+
+m2<- apply(m, 2, function(x) rlnorm(n = 20, meanlog = 0, sdlog = 1) %>% round()) %>% 
+   `rownames<-`(paste("Plot", 1:20, sep="_")) %>% 
+  as.data.frame()
+
+m2
+```
+
+Now the functional trait matrix
+
+```{r}
+# Generate some random data for 6 traits of different types
+set.seed(12345)
+
+T1 <- rnorm(n = 20, mean = 10, sd = 1)
+T2 <- rlnorm (n = 20, meanlog = 1, sdlog = 1)
+T3 <- sample(5, 20, replace = T) %>% as.ordered()
+T4 <- sample(c("Blue", "Red"), 20, replace = T) %>% as.factor()
+T5 <- sample(c(0,1), 20, replace = T) %>% as.integer()
+T6 <- T1 + rnorm(20, 5, 1)
+
+f <- data.frame(T1, T2, T3,T4,T5, T6) %>% `rownames<-`(colnames(m2)) %>% `colnames<-`(paste("Trait", 1:6, sep="_"))
+
+f
+```
+
+And a phylogeny
+
+```{r}
+set.seed(54321)
+phy <- pbtree(n=20, scale = 20)
+phy$tip.label <- colnames(m2)
+plot(phy)
+axisPhylo()
+```
+
+# Functional distance between species
+
+I can start by calculating functional distance between species, as this is one of the baselines that will guide us throughout the work.
+
+Here we will use the Gower's distance which can accommodate missing data and multiple data types (numerical, ordinal, discrete). If our dataset contains a lot of missing data, it is best to try and impute it (more on imputation methods in another tutorial).
+
+Commonly people use the `daisy` package, or the function `gowdis` from the `FD` package. Like here.
+
+```{r}
+FD <- gowdis(f)
+```
+
+But [Bello et al. 2021](https://www.youtube.com/watch?v=oUDQeKcMp6w&ab_channel=MethodsEcolEvol) argue that this can overemphasize the effect of discrete data types, which will contribute more to the multi-trait dissimilarity. There is also a problem when traits are correlated, like if we used multiple leaf traits and just 1 root trait. Using dimensionality reduction techniques such as PCA doesn't fully resolve this problem To address these issues, they devised the `gawdis` package which we will use here. Check out the [vignette here](https://cran.r-project.org/web/packages/gawdis/vignettes/gawdis.html).
+
+```{r}
+FDgaw <- gawdis::gawdis(f) 
+
+cor(FD, FDgaw)
+```
+
+Both methods produce similar results, but for the case of technical correctness, we will follow the `gawdis` approach.
+
+# Phylogenetic distance between species
+
+This one is relatively easy, we can simply transform the phylogenetic tree into a phylogenetic variance-covariance matrix, where the diagonal is equal to 0, and the off-diagonal element corresponds to the sum of branch lengths between two species.
+
+```{r}
+phy.dist <- cophenetic(phy)
+```
+
+---------------------------------------------------------------------
+
+# Moving to distances between communities
+
+## Structural dissimilarity
+
+Here we might have some structural metrics for our plots. These could be derived from satellite products or direct observations.
+
+```{r}
+# Let's create 10 structural metrics
+set.seed(123)
+
+S1 <- rnorm(n = 20, mean = 100, sd = 10)
+S2 <- S1 + rnorm(20, 10, 2) # a highly correlated variable with S1
+S3 <- S1 + rnorm(20, 20, 15) # a not so highly correlated variable S1
+S4 <- runif(n = 20, min = 0, max = 50)
+S5 <- sample(0:50, 20, replace = T)
+S6 <- S5 + rnorm(20, 20, 15) # a not so highly correlated variable with S5
+S7 <- rlnorm (n = 20, meanlog = 1, sdlog = 1)
+S8 <- rlnorm (n = 20, meanlog = 1, sdlog = 1)
+S9 <- S5 + rnorm(20, 20, 15) # a not so highly correlated variable with S5
+S10 <- S5 + rnorm(20, 20, 15) # a not so highly correlated variable with S5
+
+str <- data.frame(S1,S2, S3, S4, S5, S6, S7, S8, S9, S10) %>% `rownames<-`(rownames(m2))
+
+head(str)
+```
+
+I've deliberately included some log-distributed data to remind us to first check the data before doing anything with it!
+
+```{r}
+str %>% 
+  gather() %>% 
+  ggplot(aes(value, fill=key)) + geom_density() + facet_wrap(~key, scales = "free")
+```
+
+Even though most of these come from a normal distribution, several measures could do with a transformation.
+
+
+```{r}
+str <-str %>% 
+  mutate(S7 =log(S7), S8 = log(S8), S10 = log(S10))
+```
+
+```{r}
+str %>% 
+  gather() %>% 
+  ggplot(aes(value, fill=key)) + geom_density() + facet_wrap(~key, scales = "free")
+
+#Check their normality with shapir-test
+lapply(str, shapiro.test) %>% do.call(rbind,.)
+
+```
+
+Good stuff.
+
+Now check the correlations
+
+```{r, warning=F}
+chart.Correlation(str)
+```
+
+So based on this, we might want to reduce the number of variables (S1 or S2 for example), or perhaps we can simply perform a PCA which will give us an idea of how the plots are structurally arranged.
+
+```{r}
+str.pca <- dudi.pca(df = str, center = T, scale = T, scannf = F, nf = 10)
+fviz_pca(str.pca)
+```
+
+Let us remember that the point is to obtain a dissimilarity matrix, which we can combine with other distance matrices. 
+So there are now two options, either we work with the raw variables, and we have to somehow remove the effects of correlated variables and scale them before creating our dissimilarity matrix, or we can work with the eigenvectors of the PCA.
+
+Let's do both and compare.
+
+If we wanted to work with the raw variables, one simple option is to re-use the `gawdis` package. Just like the functional traits matrix, this will iteratively re-weigh the contribution of each "structural trait" to the dissimilarity matrix, thus correlated traits will be down-weighed. We just need to provide the `group` argument to tell the algorithm, which variables are highly correlated (here S1 + S2, and S5 + S6 + S10).
+
+```{r}
+str.dist <- gawdis(str, w.type = "optimized", groups = c(1,1,2,3,4,4,5,6,7,4))
+```
+
+The other option is to transform the result of the PCA into a distance matrix. The handy `dist.dudi()` can do that for us.
+
+```{r}
+str.dist2 <- dist.dudi(str.pca)
+```
+
+Now let's check the two.
+
+```{r}
+plot(str.dist, str.dist2)
+cor(str.dist, str.dist2)
+```
+ 
+So very similar but not quite the same.
+ 
+At this point, I would suggest working with both dissimilarity matrices in downstream analyses and see how they behave.
+
+For now, I will continue with the matrix derived from `gawdis`.
+
+--------------------------------------------------------------------------------
+
+## Floristic dissimilarity
+
+Ok now we can look at the plot data. There are many well known dissimilarity matrices available for community data, the one that is probably most used for abundance data is the Bray-Curtis dissimilarity.
+
+```{r}
+flo.dist <- vegdist(m2)
+```
+
+If we wanted to work with ordinations, we could perform a number of them, like CA, PCA on hellinger transformed abundances or NMDS [detailed review here](https://www.davidzeleny.net/anadat-r/doku.php/en:ordination). 
+
+For now let's work with a Correspondence Analysis (CA).
+
+```{r}
+ca.plot <- dudi.coa(df = m2, scannf = F, nf = 10)
+fviz_ca(ca.plot)
+```
+
+Again, we can then turn this into a dissimilarity matrix with `dist.dudi`.
+
+```{r}
+flo.dist2 <- dist.dudi(ca.plot)
+```
+
+And compare with the previous Bray-Curtis dissimilarity.
+
+```{r}
+plot(flo.dist, flo.dist2)
+mantel(flo.dist, flo.dist2)
+```
+
+Again, both are correlated but with some differences. These differences seem to get larger as the dissimilarity increases.
+
+Because dissimilarity is essentially the same idea as Beta diversity, we can work with the Beta diversity partitioning framework established by Baselga et al. 2010, that is, dividing Beta into turnover and nestedness components. Beta turnover (also called $\beta$~sim~) is often used in floristic analyses for it's independence from species richness.
+
+The package `betapart` can do this for us.
+
+```{r}
+beta.main <- betapart.core.abund(x = m2)
+
+beta.pair <- beta.pair.abund(beta.main)
+
+beta.nestedness <- beta.pair$beta.bray.gra
+beta.turnover <- beta.pair$beta.bray.bal
+```
+
+
+I will work with the Bray Curtis matrix for now.
+
+## Phylogenetic dissimilarity
+
+What if our plot data contains many plots (> 500) and many species (>1,000) ?
+It is likely that is this case, most plots will share 0 species in common. If this happens, the dissimilarity between plots will saturate at 1, and it will become difficult to make meaningful comparisons.
+
+What we can use, is the shared phylogenetic lineages between plots.
+Because all lineages are linked at least by some minimal distance (the root of the tree), we can always get a measure of dissimilarity.
+
+Here we can use the `adiv` package to compute phylogenetic pairwise beta diversity (aka phylogenetic dissimilarity). There are many different ways to compute this so I would urge you to look into the rich litterature produced by Sandrine Pavoine, Carlo Ricotta and their colleagues.
+
+```{r}
+phylo.dist <- adiv::evodiss(phyl = phy, comm = m2, method = "Hellinger")
+```
+
+As with previous dataframes, we can also use a simple ordination based method, here the `evopcahellinger` which will tend to weigh the distance of the plots by the terminal nodes of the phylogeny, rather than basal nodes.
+
+```{r}
+evo.pca <- evopcahellinger(phyl = phy, comm = m2, scannf = F, nf = 10, abundance = T, w = "evoab")
+fviz_pca(evo.pca)
+
+phylo.dist2 <- dist.dudi(evo.pca)
+```
+
+Fortunately for us, in this case, both methods produce the same distance.
+
+```{r}
+mantel(phylo.dist, phylo.dist2)
+```
+
+It's a good time to pause and think for a second that this last method is a combination of 2 pieces of information: the plot data and the phylogeny.
+
+We can do the same thing but using the functional data
+
+## Functional dissimilarity
+
+One metric that is widely used in functional ecology is Rao's Quadratic entropy. This has some nice mathematical properties and can be used as a general metric for other aspects of diversity. Again, it can be partitioned into $\alpha$, $\beta$ and $\gamma$ diversity.
+
+Once again, our good friend Francesco de Bello has written a nice function for this called `Rao`. This comes from the materials in Chapter 5 for the book _Trait based ecology in R_
+Let's import it here.
+
+```{r}
+source("../Functional traits/Trait_based_ecology_R_data_files/data/chapter5/Rao.R")
+```
+
+And let's compute Rao's QE for the functional trait data.
+Note: for some weird reason Francesco's brain flipped around the rows and columns of the community matrix when he wrote the function. Bless him. So we have to transpose the dataframe first.
+
+Also, for mathematical correctness, we must make sure that our functional dissimilarity matrix is euclidean before we use it!
+
+```{r}
+is.euclid(FDgaw)
+```
+
+A cailliez or lingoes correction is required.
+
+```{r}
+fun.dist <- Rao(sample = t(m2), dfunc = cailliez(FDgaw), dphyl = NULL, weight = F, Jost = F)
+```
+
+You can achieve the same result using `adiv`'s function `discomQE`.
+
+```{r}
+fun.dist2 <- discomQE(comm = m2, dis = cailliez(FDgaw))
+
+cor(fun.dist$FD$Pairwise_samples$Beta_add, fun.dist2)
+```
+
+Great, so we now have pure floristic distances between communities (Bray-Curtis), phylogenetic distances between communities (Hellinger's transformed evodiss) and a functional distance between communities (Rao's QE). These are all based on the site x species matrix.
+
+We also have the plot-to-plot dissimilarity matrix which is based on the structural metrics. I tend to view this as quite different from the 3 previous matrices, as it is derived from raw structure and has nothing to do with the species.
+
+---------------------------------------------------------------------------------------
+
+# Combining dissimilarities
+
+The final step is simply to add up the dissimilarity matrices and average them.
+
+Before we do that, we should make sure all our matrices are equally scaled.
+
+```{r}
+summary(matrix(fun.dist2))
+summary(matrix(phylo.dist))
+summary(matrix(flo.dist))
+summary(matrix(str.dist))
+```
+
+There are some large differences between the matrices.
+
+We can scale them between [0,1] with min-max normalisation.
+
+```{r}
+fun.dist.scaled <- (fun.dist2-min(fun.dist2)) / (max(fun.dist2) - min(fun.dist2))
+phylo.dist.scaled <- (phylo.dist-min(phylo.dist)) / (max(phylo.dist) - min(phylo.dist))
+flo.dist.scaled <- (flo.dist-min(flo.dist)) / (max(flo.dist) - min(flo.dist)) 
+str.dist.scaled <- (str.dist-min(str.dist)) / (max(str.dist) - min(str.dist))
+```
+
+Now check they are all on the same scale again.
+
+```{r}
+summary(matrix(fun.dist.scaled))
+summary(matrix(flo.dist.scaled))
+summary(matrix(phylo.dist.scaled))
+summary(matrix(str.dist.scaled))
+```
+
+Now all we have to do is add them together and average.
+
+```{r}
+combined.dist <- (fun.dist.scaled + flo.dist.scaled + phylo.dist.scaled + str.dist.scaled) / 4
+summary(matrix(combined.dist))
+```
+
+Now we can plot it using a PCoA. Check the matrix is Euclidean beforehand and add a correction if necessary.
+
+```{r}
+is.euclid(combined.dist)
+
+combined.pcoa <- dudi.pco(d = cailliez(combined.dist), scannf = F, full = T)
+prop.eig <- ((combined.pcoa$eig / sum(combined.pcoa$eig) ) * 100) %>% round(1)
+
+ggplot(combined.pcoa$li, aes(x=A1, y=A2, label=rownames(combined.pcoa$li))) + 
+  geom_point() + 
+  geom_text_repel() +
+  xlab(paste("Axis1 (", prop.eig[1], "%)", sep="")) +
+  ylab(paste("Axis2 (", prop.eig[2], "%)", sep="")) +
+  theme_classic()
+```
+
+We can check which of the distance matrices is most correlated with the final matrix
+
+```{r}
+cor(combined.dist, fun.dist.scaled)
+cor(combined.dist, phylo.dist.scaled)
+cor(combined.dist, flo.dist.scaled)
+cor(combined.dist, str.dist.scaled)
+```
+
+So it seems like floristic distance is most closely correlated and that structural distance is the least well correlated with the final matrix. This is probably because floristic, phylogenetic and functional matrices are all derrived primarily from the site x species matrix, so they all inherently share similar information, whilst the structural data is very different.
+
+# Bonus GDM
+
+As a quick intro to what you can do with dissimilarity matrices after you have compiled them, a nice modelling tool is `Generalized Dissimilarity Moddeling` or GDM for short.
+
+Just like generalized models, it is very flexible and can be used to tease apart the effects of several predictor whilst including geographical distance. Neat!
+
+Here's a quick example.
+
+Let's extract some climatic variables for random plot coordinates.
+
+```{r}
+set.seed(123)
+coords <- data.frame(long=rnorm(20, mean = 20, sd = 2), lat=rnorm(20, mean = -15, sd=2)) %>% `rownames<-`(rownames(m2))
+
+preds <- r <- getData("worldclim", var = "bio", res = 10)
+
+values <- extract(preds, coords)
+values <- data.frame(values) %>% `rownames<-`(rownames(m2))
+```
+
+Where are these plots?
+
+```{r}
+Africa <- seosawr::africa
+
+ggplot() + 
+  geom_sf(data=Africa) + 
+  geom_point(data=coords,aes(x=long,y=lat, col="red")) + 
+  geom_text_repel(data=coords, aes(x=long,y=lat,label=rownames(coords)), cex=2.5) +
+  coord_sf(ylim=c(-21,-5), xlim=c(10,30)) +
+  theme(legend.position = "none")
+  
+```
+
+
+Now format the data properly
+
+```{r}
+dissim <- as.data.frame(as.matrix(combined.dist)) %>% rownames_to_column("id")
+
+envtab <- cbind(values, coords) %>% rownames_to_column("id")
+
+gdmTab.dis <- formatsitepair(bioData=dissim, 
+                             bioFormat=3, #dissimilairty matrix 
+                             XColumn="long", 
+                             YColumn="lat", 
+                             predData=envtab, 
+                             siteColumn="id")
+```
+
+Now fit the gdm
+
+```{r}
+gdm1 <- gdm(data=gdmTab.dis, geo=TRUE)
+summary(gdm1)
+```
+
+Awesome. So we have a gdm that explains about 15% of the deviance in the data. That's pretty low, but hey this is random data after all. Be careful in overinterpretting this. 
+
+Bio15, which is precipitation seasonality which is the best predictor for the dissimilarity in our data.
+
+Remember to hit enter to move to the next plot.
+
+```{r}
+plot(gdm1)
+```
+
+Everything you wanted to learn about `GDM` right here: https://github.com/fitzLab-AL/GDM
+
+That's all folks!
