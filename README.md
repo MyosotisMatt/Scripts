@@ -1,2 +1,2 @@
 # Scripts
-This repository contains scripts for performing certain tasks in various languages
+This repository contains tutorials with scripts for performing specific tasks in various languages.
